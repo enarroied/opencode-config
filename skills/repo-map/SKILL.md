@@ -1,6 +1,6 @@
 ---
 name: repo-map
-description: Generate a compact structural skeleton of the repository (files, classes, function signatures, type annotations) without reading full source files. Trigger when exploring an unfamiliar codebase, locating where logic lives, or planning changes across multiple modules.
+description: Map a Python repository's structure (modules, classes, function and method signatures, annotations) without reading full source. Python files only; use grep or file listing for SQL, templates, and configs. Trigger when exploring an unfamiliar Python codebase, locating where logic lives, or planning changes across Python modules.
 ---
 
 # Repo Map

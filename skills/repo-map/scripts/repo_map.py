@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a compact AST skeleton of Python files in a repository."""
+"""Print a compact AST skeleton of Python files in a repository."""
 
 from __future__ import annotations
 
@@ -8,142 +8,158 @@ import ast
 import subprocess
 from pathlib import Path
 
-IGNORED_DIRS = {
-    ".git",
-    ".venv",
-    "venv",
-    "__pycache__",
-    ".pytest_cache",
-    ".ruff_cache",
-    ".mypy_cache",
-    "node_modules",
-    "build",
-    "dist",
-    ".tox",
-    ".eggs",
-}
+IGNORED_DIRS = frozenset(
+    {
+        ".git",
+        ".venv",
+        "venv",
+        "__pycache__",
+        ".pytest_cache",
+        ".ruff_cache",
+        "node_modules",
+        "build",
+        "dist",
+        ".tox",
+        ".eggs",
+    }
+)
+FUNC_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef)
 
 
 def get_python_files(root: Path) -> list[Path]:
-    """Return sorted Python files under root, respecting gitignore when available."""
-    res = subprocess.run(
+    """Return sorted Python files under root, respecting .gitignore when possible."""
+    result = subprocess.run(
         ["git", "ls-files", "--cached", "--others", "--exclude-standard", "*.py"],
         cwd=root,
         capture_output=True,
         text=True,
         check=False,
     )
-    if res.returncode == 0 and res.stdout.strip():
-        files = [root / line for line in res.stdout.splitlines() if line.strip()]
-        return sorted(f for f in files if f.is_file())
+    if result.returncode == 0 and result.stdout.strip():
+        paths = (root / line for line in result.stdout.splitlines() if line.strip())
+        return sorted(p for p in paths if p.is_file())
 
-    return sorted(
-        path
-        for path in root.rglob("*.py")
-        if not any(
-            part in IGNORED_DIRS or part.endswith(".egg-info") for part in path.parts
-        )
-    )
+    return sorted(p for p in root.rglob("*.py") if not _is_ignored(p, root))
+
+
+def _is_ignored(path: Path, root: Path) -> bool:
+    parts = path.relative_to(root).parts  # only check parts below root
+    return any(part in IGNORED_DIRS or part.endswith(".egg-info") for part in parts)
+
+
+def _is_visible(name: str, include_private: bool) -> bool:
+    is_dunder = name.startswith("__") and name.endswith("__")
+    return include_private or is_dunder or not name.startswith("_")
+
+
+def _annotated(name: str, annotation: ast.expr | None) -> str:
+    return f"{name}: {ast.unparse(annotation)}" if annotation else name
 
 
 def format_arguments(args: ast.arguments) -> str:
-    """Format function arguments with type annotations and default markers."""
+    """Format an argument list, marking defaults as '=...'."""
     parts: list[str] = []
 
-    positional = list(args.posonlyargs) + list(args.args)
-    defaults_offset = len(positional) - len(args.defaults)
-
-    for idx, arg in enumerate(positional):
-        text = arg.arg
-        if arg.annotation:
-            text += f": {ast.unparse(arg.annotation)}"
-        if idx >= defaults_offset:
+    positional = [*args.posonlyargs, *args.args]
+    first_default = len(positional) - len(args.defaults)
+    for i, arg in enumerate(positional):
+        text = _annotated(arg.arg, arg.annotation)
+        if i >= first_default:
             text += "=..."
         parts.append(text)
-        if idx == len(args.posonlyargs) - 1 and args.posonlyargs:
+        if args.posonlyargs and i == len(args.posonlyargs) - 1:
             parts.append("/")
 
     if args.vararg:
-        vararg = f"*{args.vararg.arg}"
-        if args.vararg.annotation:
-            vararg += f": {ast.unparse(args.vararg.annotation)}"
-        parts.append(vararg)
+        parts.append("*" + _annotated(args.vararg.arg, args.vararg.annotation))
     elif args.kwonlyargs:
         parts.append("*")
 
-    for arg, default in zip(args.kwonlyargs, args.kw_defaults, strict=True):
-        text = arg.arg
-        if arg.annotation:
-            text += f": {ast.unparse(arg.annotation)}"
-        if default is not None:
-            text += "=..."
-        parts.append(text)
+    for arg, default in zip(args.kwonlyargs, args.kw_defaults):
+        text = _annotated(arg.arg, arg.annotation)
+        parts.append(text + ("=..." if default is not None else ""))
 
     if args.kwarg:
-        kwarg = f"**{args.kwarg.arg}"
-        if args.kwarg.annotation:
-            kwarg += f": {ast.unparse(args.kwarg.annotation)}"
-        parts.append(kwarg)
+        parts.append("**" + _annotated(args.kwarg.arg, args.kwarg.annotation))
 
     return ", ".join(parts)
 
 
-def format_func(node: ast.FunctionDef | ast.AsyncFunctionDef, indent: str = "") -> str:
-    """Format a function or method signature."""
+def format_signature(
+    node: ast.FunctionDef | ast.AsyncFunctionDef, indent: str = ""
+) -> str:
+    """Format decorators and the signature of a function or method."""
     prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
     params = format_arguments(node.args)
     ret = f" -> {ast.unparse(node.returns)}" if node.returns else ""
-    decorators = [f"{indent}@{ast.unparse(d)}" for d in node.decorator_list]
-    sig = f"{indent}{prefix} {node.name}({params}){ret}"
-    return "\n".join([*decorators, sig])
+
+    lines = [f"{indent}@{ast.unparse(d)}" for d in node.decorator_list]
+    lines.append(f"{indent}{prefix} {node.name}({params}){ret}")
+    return "\n".join(lines)
 
 
 def summarize_class(node: ast.ClassDef, include_private: bool) -> list[str]:
-    """Extract class header, annotated attributes, and method signatures."""
+    """Return the class header, annotated attributes, and method signatures."""
     bases = f"({', '.join(ast.unparse(b) for b in node.bases)})" if node.bases else ""
-    decorators = [f"@{ast.unparse(d)}" for d in node.decorator_list]
-    lines = [*decorators, f"class {node.name}{bases}:"]
+    header = [f"@{ast.unparse(d)}" for d in node.decorator_list]
+    header.append(f"class {node.name}{bases}:")
 
-    body_lines: list[str] = []
+    body: list[str] = []
     for item in node.body:
-        if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
-            name = item.target.id
-            if include_private or not name.startswith("_"):
-                body_lines.append(f"  {name}: {ast.unparse(item.annotation)}")
-        elif isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            is_dunder = item.name.startswith("__") and item.name.endswith("__")
-            if include_private or not item.name.startswith("_") or is_dunder:
-                body_lines.append(format_func(item, indent="  "))
+        if (
+            isinstance(item, ast.AnnAssign)
+            and isinstance(item.target, ast.Name)
+            and _is_visible(item.target.id, include_private)
+        ):
+            body.append(f"  {item.target.id}: {ast.unparse(item.annotation)}")
+        elif isinstance(item, FUNC_TYPES) and _is_visible(item.name, include_private):
+            body.append(format_signature(item, indent="  "))
 
-    if not body_lines:
-        body_lines.append("  ...")
-    return lines + body_lines
+    return header + (body or ["  ..."])
 
 
-def summarize_file(path: Path, root: Path, include_private: bool) -> str | None:
-    """Parse a single Python file and return its structural skeleton."""
+def summarize_file(path: Path, base: Path, include_private: bool) -> str | None:
+    """Return the skeleton for one file, or None if it has nothing to show."""
     try:
-        source = path.read_text(encoding="utf-8")
-        tree = ast.parse(source, filename=str(path))
-    except (OSError, SyntaxError):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    except (OSError, SyntaxError, UnicodeDecodeError):
         return None
 
-    rel_path = path.relative_to(root)
     doc = ast.get_docstring(tree, clean=True)
-    first_doc_line = f"  # {doc.splitlines()[0]}" if doc else ""
-    out: list[str] = [f"{rel_path}{first_doc_line}"]
+    comment = f"  # {doc.splitlines()[0]}" if doc else ""
+    lines = [f"{path.relative_to(base)}{comment}"]
 
     for node in tree.body:
+        if not _is_visible(getattr(node, "name", "_"), include_private):
+            continue
         if isinstance(node, ast.ClassDef):
-            if include_private or not node.name.startswith("_"):
-                out.extend(summarize_class(node, include_private))
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if include_private or not node.name.startswith("_"):
-                out.append(format_func(node))
+            lines.extend(summarize_class(node, include_private))
+        elif isinstance(node, FUNC_TYPES):
+            lines.append(format_signature(node))
 
-    if len(out) == 1:
-        return None
-    return "\n".join(out)
+    return "\n".join(lines) if len(lines) > 1 else None
+
+
+def build_skeleton(target: Path, include_private: bool, max_lines: int) -> str:
+    """Build the full skeleton text for a file or directory."""
+    root = target.resolve()
+    if root.is_file():
+        files, base = [root], root.parent
+    else:
+        files, base = get_python_files(root), root
+
+    sections = [s for f in files if (s := summarize_file(f, base, include_private))]
+    if not sections:
+        return "No Python definitions found."
+
+    lines = "\n\n".join(sections).splitlines()
+    if len(lines) > max_lines:
+        hidden = len(lines) - max_lines
+        lines = [
+            *lines[:max_lines],
+            f"... (+{hidden} more lines; pass a subdirectory to narrow scope)",
+        ]
+    return "\n".join(lines)
 
 
 def main() -> None:
@@ -151,7 +167,7 @@ def main() -> None:
         description="Print a compact AST skeleton of Python files."
     )
     parser.add_argument(
-        "target", nargs="?", default=".", help="Directory to scan (default: .)"
+        "target", nargs="?", default=".", help="Directory or file to scan (default: .)"
     )
     parser.add_argument(
         "--include-private",
@@ -166,33 +182,12 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    root = Path(args.target).resolve()
-    if not root.exists():
-        print(f"Path not found: {root}")
+    target = Path(args.target)
+    if not target.exists():
+        print(f"Path not found: {target.resolve()}")
         return
 
-    files = [root] if root.is_file() else get_python_files(root)
-    base = root.parent if root.is_file() else root
-
-    sections: list[str] = []
-    for file_path in files:
-        summary = summarize_file(file_path, base, args.include_private)
-        if summary:
-            sections.append(summary)
-
-    if not sections:
-        print("No Python definitions found.")
-        return
-
-    output = "\n\n".join(sections).splitlines()
-    if len(output) > args.max_lines:
-        hidden = len(output) - args.max_lines
-        output = [
-            *output[: args.max_lines],
-            f"... (+{hidden} more lines; pass a subdirectory to narrow scope)",
-        ]
-
-    print("\n".join(output))
+    print(build_skeleton(target, args.include_private, args.max_lines))
 
 
 if __name__ == "__main__":
